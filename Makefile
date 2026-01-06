@@ -3,10 +3,11 @@ VENV := .venv
 VENV_BIN := $(VENV)/bin
 PIP := $(VENV_BIN)/pip
 PY_API_PORT ?= 8000
+NODE ?= node
 
 .PHONY: venv install demo frontend-install frontend-dev frontend-build clean-memory \
-	backend-install backend-start python-api-start \
-	v pi d fi fd fb cm bi bs pa
+	backend-install backend-start backend-stop python-api-start python-api-stop dev-help \
+	v pi d fi fd fb cm bi bs pa bstop pstop
 
 venv: $(VENV)/bin/activate
 $(VENV)/bin/activate:
@@ -36,11 +37,28 @@ backend-install:
 	npm install
 
 backend-start:
-	npm start
+	@echo "Starting Node proxy on PORT=$${PORT:-3030} (reads .env)..."
+	$(NODE) server.js
+
+backend-stop:
+	@echo "Stopping Node proxy (matching 'node server.js')..."
+	-@pkill -f "node server.js" || true
 
 # Python FastAPI (knowledge brain)
 python-api-start: install
+	@echo "Starting Python API on port $(PY_API_PORT) (loading .env)..."
+	@set -a; . .env; set +a; \
 	$(VENV_BIN)/uvicorn python_api:app --host 0.0.0.0 --port $(PY_API_PORT)
+
+python-api-stop:
+	@echo "Stopping Python API (matching 'uvicorn python_api:app')..."
+	-@pkill -f "uvicorn python_api:app" || true
+
+dev-help:
+	@echo "Use three terminals:"
+	@echo "1) make python-api-start"
+	@echo "2) make backend-start   # Node proxy"
+	@echo "3) make frontend-dev    # Vite dev server"
 
 # Short aliases
 v: venv
@@ -53,3 +71,5 @@ cm: clean-memory
 bi: backend-install
 bs: backend-start
 pa: python-api-start
+bstop: backend-stop
+pstop: python-api-stop

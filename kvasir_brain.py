@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import mailbox
+import os
 import re
 import uuid
 from datetime import datetime
@@ -12,13 +12,13 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-import networkx as nx
 from chromadb.utils import embedding_functions
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
+from neo4j import GraphDatabase, Driver
 
 
 TRIPLE_PROMPT = """You are a precise information extraction system.
@@ -36,6 +36,240 @@ TEXT:
 {text}
 """
 
+RESOLUTION_PROMPT = """You are an intelligent entity resolution system. Your task is to determine if a "New Entity" is the same as any of the "Existing Entities" from a knowledge graph.
+The entities can be people, projects, companies, or abstract concepts.
+Focus on semantic meaning, not just string similarity. For example, "Dr. Jane" and "Jane Smith" are likely the same person, but "Project Alpha" and "Project Beta" are not.
+
+New Entity:
+{new_entity}
+
+Existing Entities:
+{existing_entities}
+
+Question:
+Which of the "Existing Entities" is the best match for the "New Entity"?
+Respond with the single best matching name from the "Existing Entities" list. If there is no clear match, respond with the word NONE.
+"""
+
+
+class Neo4jGraph:
+    def __init__(self, driver: Driver, resolution_chain, verbose: bool = False):
+        self.driver = driver
+        self.resolution_chain = resolution_chain
+        self.verbose = verbose
+        self.apoc_available = False
+        self._ensure_constraints()
+        self._check_apoc()
+
+    def _ensure_constraints(self) -> None:
+        """Ensure uniqueness constraints are set for Entity nodes on the label property."""
+        with self.driver.session() as session:
+            try:
+                session.run("DROP CONSTRAINT IF EXISTS ON (n:Entity) REQUIRE n.name IS UNIQUE")
+            except Exception:
+                # Already dropped or not present.
+                pass
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Entity) REQUIRE n.label IS UNIQUE")
+
+    def _check_apoc(self) -> None:
+        """Detect whether APOC is available for helper functions."""
+        try:
+            with self.driver.session() as session:
+                session.run("RETURN apoc.text.levenshteinDistance('a','b') AS d").single()
+                session.run("RETURN apoc.coll.union([1], [2]) AS u").single()
+            self.apoc_available = True
+        except Exception:
+            self.apoc_available = False
+            if self.verbose:
+                print("⚠️  APOC not available; falling back to simpler graph operations (no fuzzy matching).")
+
+    def _resolve_entity(self, label: str, session=None, cache: Dict[str, str] | None = None) -> str:
+        """Finds or creates a canonical entity label."""
+        if not label:
+            return ""
+
+        if cache is not None and label in cache:
+            return cache[label]
+
+        own_session = False
+        if session is None:
+            session = self.driver.session()
+            own_session = True
+
+        try:
+            result = session.run(
+                "MATCH (e:Entity) WHERE e.aliases IS NOT NULL AND $label IN e.aliases RETURN e.label",
+                label=label,
+            ).single()
+            if result:
+                resolved = result["e.label"]
+                if cache is not None:
+                    cache[label] = resolved
+                return resolved
+
+            # Step 2: Find candidates for resolution
+            find_candidates_query = """
+            MATCH (e:Entity)
+            WHERE apoc.text.levenshteinDistance(e.label, $label) < 4
+            RETURN e.label AS label
+            LIMIT 5
+            """
+            if not self.apoc_available:
+                find_candidates_query = """
+                MATCH (e:Entity)
+                WHERE toLower(e.label) CONTAINS toLower($label) OR toLower($label) CONTAINS toLower(e.label)
+                RETURN e.label AS label
+                LIMIT 5
+                """
+            candidates = [row["label"] for row in session.run(find_candidates_query, label=label)]
+        except Exception as e:
+            if self.verbose:
+                print(f"Entity resolution lookup failed for '{label}': {e}")
+            candidates = []
+        finally:
+            if own_session:
+                session.close()
+
+        if not candidates:
+            if cache is not None:
+                cache[label] = label
+            return label
+
+        # Step 3: Ask LLM for resolution
+        try:
+            resolved_name = self.resolution_chain.invoke({
+                "new_entity": label,
+                "existing_entities": "\n".join(f"- {c}" for c in candidates)
+            }).strip()
+
+            if self.verbose:
+                print(f"Resolving '{label}': candidates={candidates}, chosen='{resolved_name}'")
+
+            if resolved_name != "NONE" and resolved_name in candidates:
+                if cache is not None:
+                    cache[label] = resolved_name
+                return resolved_name # Return the canonical label of the matched entity
+
+        except Exception as e:
+            if self.verbose:
+                print(f"Entity resolution LLM call failed: {e}")
+
+        if cache is not None:
+            cache[label] = label
+        return label # Default to original label if no match or on error
+
+    def update_graph(self, triples: Iterable[Tuple[str, str, str]], source_uid: str | None = None) -> None:
+        """
+        Resolves entities and merges triples into the Neo4j graph.
+        """
+        triples_list = list(triples)
+        if not triples_list:
+            return
+
+        resolution_cache: Dict[str, str] = {}
+        batch: List[Dict[str, str]] = []
+
+        with self.driver.session() as session:
+            for subj_original, pred, obj_original in triples_list:
+                subj_canonical = self._resolve_entity(subj_original, session=session, cache=resolution_cache)
+                obj_canonical = self._resolve_entity(obj_original, session=session, cache=resolution_cache)
+                batch.append(
+                    {
+                        "subj_canonical": subj_canonical,
+                        "subj_original": subj_original,
+                        "obj_canonical": obj_canonical,
+                        "obj_original": obj_original,
+                        "predicate": pred,
+                        "source_uid": source_uid,
+                    }
+                )
+
+            if not batch:
+                return
+
+            alias_union = (
+                "apoc.coll.union(coalesce({alias}, []), [t.{original}])"
+                if self.apoc_available
+                else "coalesce({alias}, []) + [t.{original}]"
+            )
+            subj_alias_expr = alias_union.format(alias="subj.aliases", original="subj_original")
+            obj_alias_expr = alias_union.format(alias="obj.aliases", original="obj_original")
+
+            merge_query = f"""
+            UNWIND $batch AS t
+            MERGE (subj:Entity {{label: t.subj_canonical}})
+            ON CREATE SET subj.aliases = [t.subj_original]
+            ON MATCH SET subj.aliases = {subj_alias_expr}
+
+            MERGE (obj:Entity {{label: t.obj_canonical}})
+            ON CREATE SET obj.aliases = [t.obj_original]
+            ON MATCH SET obj.aliases = {obj_alias_expr}
+
+            MERGE (subj)-[rel:RELATES_TO {{predicate: t.predicate}}]->(obj)
+            ON CREATE SET rel.source_uid = t.source_uid
+            """
+            session.run(merge_query, batch=batch)
+
+        if self.verbose:
+            print(f"Updated graph with {len(batch)} triples (with entity resolution).")
+
+    def get_relations(self, entity: str) -> List[Dict[str, str]]:
+        """
+        Recall all relationships for an entity, searching by label or alias.
+        Performs simple normalization so "Project Alpha" and "Project_Alpha"
+        both match stored nodes.
+        """
+        if not entity:
+            return []
+
+        normalized = entity.strip()
+        underscored = normalized.replace(" ", "_")
+        spaced = normalized.replace("_", " ")
+
+        query = """
+        MATCH (n:Entity)
+        WHERE
+          toLower(n.label) = toLower($normalized) OR
+          toLower(n.label) = toLower($underscored) OR
+          toLower(replace(n.label, '_', ' ')) = toLower($spaced) OR
+          toLower($normalized) IN [x IN coalesce(n.aliases, []) | toLower(x)] OR
+          toLower($underscored) IN [x IN coalesce(n.aliases, []) | toLower(x)] OR
+          toLower($spaced) IN [x IN coalesce(n.aliases, []) | toLower(x)]
+        OPTIONAL MATCH (n)-[r]->(obj)
+        OPTIONAL MATCH (subj)-[r2]->(n)
+        WITH n,
+             COLLECT(DISTINCT {subject: n.label, predicate: r.predicate, object: obj.label}) AS outgoing,
+             COLLECT(DISTINCT {subject: subj.label, predicate: r2.predicate, object: n.label}) AS incoming
+        RETURN outgoing, incoming
+        """
+        with self.driver.session() as session:
+            result = session.run(
+                query,
+                normalized=normalized,
+                underscored=underscored,
+                spaced=spaced,
+            ).single()
+            if not result:
+                return []
+
+            relations = [
+                rel
+                for rel in result["outgoing"]
+                if rel["subject"] and rel["predicate"] and rel["object"]
+            ]
+            relations.extend(
+                [
+                    rel
+                    for rel in result["incoming"]
+                    if rel["subject"] and rel["predicate"] and rel["object"]
+                ]
+            )
+            return relations
+
+    def close(self) -> None:
+        if self.driver:
+            self.driver.close()
+
 
 class KvasirBrain:
     def __init__(
@@ -51,7 +285,6 @@ class KvasirBrain:
         self.memory_dir = Path(memory_dir)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.chroma_path = self.memory_dir / "chroma"
-        self.graph_path = self.memory_dir / "graph.json"
         self.max_triples = max_triples
 
         if use_chroma_default_embeddings:
@@ -82,10 +315,32 @@ class KvasirBrain:
                 f"Ollama model '{llm_model}' is unavailable. Is Ollama running?"
             ) from exc
 
-        prompt = ChatPromptTemplate.from_template(TRIPLE_PROMPT)
-        self.triple_chain = prompt | self.llm | StrOutputParser()
+        triple_prompt = ChatPromptTemplate.from_template(TRIPLE_PROMPT)
+        self.triple_chain = triple_prompt | self.llm | StrOutputParser()
 
-        self.graph: nx.MultiDiGraph = self._load_graph()
+        resolution_prompt = ChatPromptTemplate.from_template(RESOLUTION_PROMPT)
+        self.resolution_chain = resolution_prompt | self.llm | StrOutputParser()
+
+        try:
+            uri = os.environ["NEO4J_URI"]
+            user = os.environ["NEO4J_USER"]
+            password = os.environ["NEO4J_PASSWORD"]
+            driver = GraphDatabase.driver(uri, auth=(user, password))
+            driver.verify_connectivity()
+            self.graph = Neo4jGraph(driver, resolution_chain=self.resolution_chain, verbose=self.verbose)
+            if self.verbose:
+                print(f"🔗 Connected to Neo4j at {uri}")
+        except (KeyError, Exception) as exc:
+            raise RuntimeError(
+                "Neo4j connection failed. Ensure NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD are set."
+            ) from exc
+
+    def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if hasattr(self, "graph") and self.graph:
+            self.graph.close()
 
     def ingest_file(self, filepath: str | Path) -> None:
         path = Path(filepath)
@@ -113,7 +368,7 @@ class KvasirBrain:
         doc_uid = self._store_text(content, metadata)
         triples = self._extract_triples(content)
         if triples:
-            self._update_graph(triples, source_uid=doc_uid)
+            self.graph.update_graph(triples, source_uid=doc_uid)
         return doc_uid
 
     # Backwards-compatible alias mirroring the user's original API.
@@ -126,28 +381,7 @@ class KvasirBrain:
         ]
 
     def recall_structure(self, entity: str) -> List[Dict[str, str]]:
-        node_id = self._normalize_label(entity)
-        if node_id not in self.graph:
-            return []
-
-        results = []
-        for src, _, data in self.graph.in_edges(node_id, data=True):
-            results.append(
-                {
-                    "subject": self.graph.nodes[src].get("label", src),
-                    "predicate": data.get("predicate", ""),
-                    "object": self.graph.nodes[node_id].get("label", node_id),
-                }
-            )
-        for _, target, data in self.graph.out_edges(node_id, data=True):
-            results.append(
-                {
-                    "subject": self.graph.nodes[node_id].get("label", node_id),
-                    "predicate": data.get("predicate", ""),
-                    "object": self.graph.nodes[target].get("label", target),
-                }
-            )
-        return results
+        return self.graph.get_relations(entity)
 
     def generate_briefing(
         self, topic: str, target_person: str, goal: str, n_results: int = 3
@@ -193,7 +427,7 @@ class KvasirBrain:
         doc_uid = self._store_text(text_for_store, metadata)
         triples = self._extract_triples(text_for_store)
         if triples:
-            self._update_graph(triples, source_uid=doc_uid)
+            self.graph.update_graph(triples, source_uid=doc_uid)
 
     def _ingest_eml(self, path: Path) -> None:
         parser = BytesParser(policy=policy.default)
@@ -240,7 +474,7 @@ class KvasirBrain:
         doc_uid = self._store_text(text_for_store, metadata)
         triples = self._extract_triples(text_for_store)
         if triples:
-            self._update_graph(triples, source_uid=doc_uid)
+            self.graph.update_graph(triples, source_uid=doc_uid)
 
     def _store_text(self, text: str, metadata: Dict[str, object]) -> str:
         uid = str(metadata.get("uid") or metadata.get("id") or f"doc-{uuid.uuid4()}")
@@ -284,30 +518,6 @@ class KvasirBrain:
             if subj and pred and obj:
                 triples.append((subj, pred, obj))
         return triples
-
-    def _update_graph(
-        self, triples: Iterable[Tuple[str, str, str]], source_uid: str | None = None
-    ) -> None:
-        for subj, pred, obj in triples:
-            subj_id = self._normalize_label(subj)
-            obj_id = self._normalize_label(obj)
-
-            if subj_id not in self.graph:
-                self.graph.add_node(subj_id, label=subj)
-            if obj_id not in self.graph:
-                self.graph.add_node(obj_id, label=obj)
-
-            is_duplicate = any(
-                data.get("predicate") == pred and target == obj_id
-                for _, target, data in self.graph.out_edges(subj_id, data=True)
-            )
-            if not is_duplicate:
-                edge_data = {"predicate": pred}
-                if source_uid:
-                    edge_data["source_uid"] = source_uid
-                self.graph.add_edge(subj_id, obj_id, **edge_data)
-
-        self._persist_graph()
 
     def _analyze_profile(self, name: str, context_texts: List[str]) -> str:
         joined = "\n---\n".join(context_texts) if context_texts else "No specific history found."
@@ -405,32 +615,6 @@ Script:
         text = re.sub(r"[_*#>-]{1,3}", "", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
-
-    def _load_graph(self) -> nx.MultiDiGraph:
-        if not self.graph_path.exists():
-            return nx.MultiDiGraph()
-
-        data = json.loads(self.graph_path.read_text(encoding="utf-8"))
-        graph = nx.MultiDiGraph()
-        for node in data.get("nodes", []):
-            graph.add_node(node["id"], **node.get("data", {}))
-        for edge in data.get("edges", []):
-            graph.add_edge(edge["source"], edge["target"], **edge.get("data", {}))
-        return graph
-
-    def _persist_graph(self) -> None:
-        payload = {
-            "nodes": [
-                {"id": node_id, "data": data}
-                for node_id, data in self.graph.nodes(data=True)
-            ],
-            "edges": [
-                {"source": src, "target": tgt, "data": data}
-                for src, tgt, data in self.graph.edges(data=True)
-            ],
-        }
-        self.graph_path.parent.mkdir(parents=True, exist_ok=True)
-        self.graph_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 __all__ = ["KvasirBrain"]

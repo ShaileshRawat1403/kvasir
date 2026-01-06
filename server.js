@@ -18,7 +18,7 @@ const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const DEFAULT_MODEL = process.env.OLLAMA_MODEL || "phi3";
 const DEFAULT_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX || 4096);
 const PY_API_BASE = process.env.PY_API_BASE || "http://localhost:8000";
-const PY_API_TIMEOUT_MS = Number(process.env.PY_API_TIMEOUT_MS || 8000);
+const PY_API_TIMEOUT_MS = Number(process.env.PY_API_TIMEOUT_MS || 30000);
 const IMAP_HOST = process.env.IMAP_HOST || "";
 const IMAP_PORT = Number(process.env.IMAP_PORT || 993);
 const IMAP_USER = process.env.IMAP_USER || "";
@@ -210,22 +210,29 @@ class EmailStore {
     }));
   }
 
-  getThread(threadId) {
-    const threadRow = this.db
-      .prepare("SELECT * FROM threads WHERE id = ?")
-      .get(threadId);
-    if (!threadRow) return { thread: null, messages: [] };
+  countMessages(threadId) {
+    const row = this.db.prepare("SELECT COUNT(*) as cnt FROM messages WHERE thread_id = ?").get(threadId);
+    return row?.cnt || 0;
+  }
+
+  getThread(threadId, { limit = 80 } = {}) {
+    const threadRow = this.db.prepare("SELECT * FROM threads WHERE id = ?").get(threadId);
+    if (!threadRow) return { thread: null, messages: [], totalMessages: 0 };
 
     const msgRows = this.db
-      .prepare("SELECT * FROM messages WHERE thread_id = ? ORDER BY datetime(date) ASC")
-      .all(threadId);
+      .prepare("SELECT * FROM messages WHERE thread_id = ? ORDER BY datetime(date) DESC LIMIT ?")
+      .all(threadId, limit);
 
-    const messages = msgRows.map((row) => ({
-      id: row.id,
-      uid: row.uid,
-      threadId: row.thread_id,
-      subject: row.subject,
-      from: this.safeParse(row.from_list, []),
+    const totalMessages = this.countMessages(threadId);
+
+    const messages = msgRows
+      .reverse() // present oldest -> newest to the UI
+      .map((row) => ({
+        id: row.id,
+        uid: row.uid,
+        threadId: row.thread_id,
+        subject: row.subject,
+        from: this.safeParse(row.from_list, []),
       to: this.safeParse(row.to_list, []),
       cc: this.safeParse(row.cc_list, []),
       date: row.date,
@@ -234,9 +241,9 @@ class EmailStore {
       inReplyTo: row.in_reply_to,
       references: this.safeParse(row.references_list, []),
       unread: !!row.unread,
-      labels: this.safeParse(row.labels, []),
-      attachments: this.safeParse(row.attachments, []),
-    }));
+        labels: this.safeParse(row.labels, []),
+        attachments: this.safeParse(row.attachments, []),
+      }));
 
     const thread = {
       id: threadRow.id,
@@ -249,7 +256,7 @@ class EmailStore {
       hasAttachments: !!threadRow.has_attachments,
     };
 
-    return { thread, messages };
+    return { thread, messages, totalMessages };
   }
 
   safeParse(val, fallback) {
@@ -576,25 +583,25 @@ async function buildThreads({
   return sorted.slice(0, limit);
 }
 
-function getCachedThread(threadId) {
-  return emailStore.getThread(threadId);
+function getCachedThread(threadId, limit = 80) {
+  return emailStore.getThread(threadId, { limit });
 }
 
 async function loadThread(threadId, limit = 80) {
-  const cached = getCachedThread(threadId);
+  const cached = getCachedThread(threadId, limit);
   if (cached && cached.thread && cached.messages.length) {
     await hydrateThreadMessages(cached.messages);
-    return emailStore.getThread(threadId);
+    return emailStore.getThread(threadId, { limit });
   }
 
   await buildThreads(limit);
-  const refreshed = getCachedThread(threadId);
+  const refreshed = getCachedThread(threadId, limit);
   if (refreshed && refreshed.thread && refreshed.messages.length) {
     await hydrateThreadMessages(refreshed.messages);
-    return emailStore.getThread(threadId);
+    return emailStore.getThread(threadId, { limit });
   }
 
-  return { thread: null, messages: [] };
+  return { thread: null, messages: [], totalMessages: 0 };
 }
 
 async function hydrateThreadMessages(messages) {
@@ -844,6 +851,46 @@ app.get("/api/knowledge/graph", async (req, res) => {
   }
 });
 
+// Graph preview for visualization (capped)
+app.get("/api/knowledge/graph-preview", async (req, res) => {
+  const entity = (req.query.entity || "").trim();
+  const limitParam = req.query.limit ? Number(req.query.limit) : 200;
+  const edgeLimit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : 200;
+  if (!entity) return res.status(400).json({ error: "entity is required" });
+
+  try {
+    const data = await callPythonApi(`/graph?entity=${encodeURIComponent(entity)}`);
+    const relations = Array.isArray(data?.relations) ? data.relations : [];
+    const nodesMap = new Map();
+    const edges = [];
+
+    for (const rel of relations) {
+      if (edges.length >= edgeLimit) break;
+      if (!rel.subject || !rel.object) continue;
+      nodesMap.set(rel.subject, { id: rel.subject, label: rel.subject });
+      nodesMap.set(rel.object, { id: rel.object, label: rel.object });
+      edges.push({
+        source: rel.subject,
+        target: rel.object,
+        predicate: rel.predicate || "relates_to",
+      });
+    }
+
+    const moreAvailable = relations.length > edges.length;
+    return res.json({
+      entity,
+      nodes: Array.from(nodesMap.values()),
+      edges,
+      moreAvailable,
+      totalRelations: relations.length,
+      edgeLimit,
+    });
+  } catch (err) {
+    const msg = err?.message || String(err);
+    return res.status(502).json({ error: "Python graph preview failed", details: msg });
+  }
+});
+
 app.post("/api/knowledge/chat", async (req, res) => {
   const { messages, query, persona, goal, k, model } = req.body || {};
   if (!Array.isArray(messages) || !messages.length) {
@@ -939,15 +986,17 @@ app.get("/api/email/threads", async (req, res) => {
 // Email: thread detail
 app.get("/api/email/thread/:id", async (req, res) => {
   const threadId = req.params.id;
+  const limitParam = req.query.limit ? Number(req.query.limit) : 80;
+  const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : 80;
   if (!threadId) {
     return res.status(400).json({ error: "threadId is required" });
   }
   try {
-    const { thread, messages } = await loadThread(threadId);
+    const { thread, messages, totalMessages } = await loadThread(threadId, limit);
     if (!thread) {
       return res.status(404).json({ error: "Thread not found" });
     }
-    return res.json({ thread, messages });
+    return res.json({ thread, messages, totalMessages });
   } catch (err) {
     const msg = err?.message || String(err);
     return res.status(500).json({ error: "Failed to load thread", details: msg });

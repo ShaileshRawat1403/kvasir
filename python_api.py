@@ -198,7 +198,7 @@ def chat(req: ChatRequest) -> Dict[str, Any]:
             if model_name == OLLAMA_MODEL
             else ChatOllama(model=model_name, temperature=0.3, num_ctx=OLLAMA_NUM_CTX)
         )
-        completion = brain.llm.invoke(
+        completion = llm.invoke(
             [
                 SystemMessage(content=system),
                 HumanMessage(content=user_prompt),

@@ -4,37 +4,50 @@ from kvasir_brain import KvasirBrain
 
 
 def main() -> None:
-    brain = KvasirBrain()
+    try:
+        brain = KvasirBrain(verbose=True)
+    except RuntimeError as e:
+        print(f"Error initializing KvasirBrain: {e}")
+        print("Please ensure Neo4j is running and connection details are set in your environment.")
+        return
+
     sample_dir = Path("sample_data")
     if not sample_dir.exists():
         print("Missing sample_data directory.")
+        brain.close()
         return
 
+    print("--- Ingesting sample data ---")
     for file_path in sorted(sample_dir.iterdir()):
         if file_path.is_file():
-            print(f"Ingesting {file_path}")
+            print(f"Ingesting {file_path}...")
             brain.ingest_file(file_path)
+    print("--- Ingestion complete ---\n")
 
-    print("\nGraph nodes:")
-    for node_id, data in brain.graph.nodes(data=True):
-        print(f"- {data.get('label', node_id)} ({node_id})")
 
-    print("\nGraph edges:")
-    for src, tgt, data in brain.graph.edges(data=True):
-        src_label = brain.graph.nodes[src].get("label", src)
-        tgt_label = brain.graph.nodes[tgt].get("label", tgt)
-        print(f"- {src_label} -[{data.get('predicate', '')}]-> {tgt_label}")
-
+    print("--- Recall examples ---")
     print("\nNeighbors for 'Project Alpha':")
-    for rel in brain.recall_structure("Project Alpha"):
-        print(f"- {rel['subject']} -[{rel['predicate']}]-> {rel['object']}")
+    try:
+        for rel in brain.recall_structure("Project Alpha"):
+            print(f"- {rel['subject']} -[{rel['predicate']}]-> {rel['object']}")
+    except Exception as e:
+        print(f"Error recalling structure: {e}")
+
 
     print("\nVector recall for 'deadline next friday':")
-    for item in brain.recall_vectors("deadline next friday", k=3):
-        title = item["metadata"].get("subject") or item["metadata"].get("title") or "untitled"
-        first_line = item["content"].splitlines()[0] if item["content"] else ""
-        preview = first_line[:120]
-        print(f"- {title}: {preview}")
+    try:
+        for item in brain.recall_vectors("deadline next friday", k=3):
+            metadata = item.get("metadata", {})
+            title = metadata.get("subject") or metadata.get("title") or "untitled"
+            first_line = item["content"].splitlines()[0] if item["content"] else ""
+            preview = first_line[:120]
+            print(f"- {title}: {preview}")
+    except Exception as e:
+        print(f"Error recalling vectors: {e}")
+
+    finally:
+        print("\n--- Demo finished, closing connections ---")
+        brain.close()
 
 
 if __name__ == "__main__":
