@@ -53,6 +53,8 @@ Extraction prompt expects strictly `Subject|Predicate|Object` lines; predicates 
 - `make clean-memory` — remove persisted vector data in `kvasir_memory/`. Note: This does not affect the Neo4j graph.
 - `make backend-install` — install Node proxy deps (Express/CORS).
 - `make backend-start` — run the Node proxy to Ollama.
+- `make dev-fast` — start Python API + Node proxy + frontend dev server in the background (logs in `logs/`).
+- `make dev-stop` — stop the background processes started by `make dev-fast`.
 - Aliases: `bi` (backend-install), `bs` (backend-start), plus existing short forms (`v`, `pi`, `d`, `fi`, `fd`, `fb`, `cm`).
 
 ## Storage layout

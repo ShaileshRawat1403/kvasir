@@ -6,8 +6,8 @@ PY_API_PORT ?= 8000
 NODE ?= node
 
 .PHONY: venv install demo frontend-install frontend-dev frontend-build clean-memory \
-	backend-install backend-start backend-stop python-api-start python-api-stop dev-help \
-	v pi d fi fd fb cm bi bs pa bstop pstop
+	backend-install backend-start backend-stop python-api-start python-api-stop dev-help dev-fast dev-stop \
+	v pi d fi fd fb cm bi bs pa bstop pstop df ds
 
 venv: $(VENV)/bin/activate
 $(VENV)/bin/activate:
@@ -59,6 +59,15 @@ dev-help:
 	@echo "1) make python-api-start"
 	@echo "2) make backend-start   # Node proxy"
 	@echo "3) make frontend-dev    # Vite dev server"
+	@echo ""
+	@echo "Or run all three in the background:"
+	@echo "  make dev-fast"
+
+dev-fast:
+	@bash scripts/dev_fast.sh
+
+dev-stop:
+	@bash scripts/dev_stop.sh
 
 # Short aliases
 v: venv
@@ -73,3 +82,5 @@ bs: backend-start
 pa: python-api-start
 bstop: backend-stop
 pstop: python-api-stop
+df: dev-fast
+ds: dev-stop
